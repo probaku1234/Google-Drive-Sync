@@ -24,6 +24,7 @@ class GoogleDriveFolderSynchronizer:
         with open('config.json', encoding='UTF-8') as json_data_file:
             self.config = json.load(json_data_file)
         self._get_credential()
+        self.file_tree = [{}] * 100
 
     def _get_credential(self):
         """
@@ -179,6 +180,7 @@ class GoogleDriveFolderSynchronizer:
                                            media_body=media,
                                            fields='id').execute()
         print('File ID: %s' % file.get('id'))
+        return file.get('id')
 
     def _update_file(self, file_id, file_name, path):
         """
@@ -204,6 +206,85 @@ class GoogleDriveFolderSynchronizer:
             print('An error occurred: %s' % error)
             return False
 
+    def _get_file_content(self, file_id):
+        try:
+            return self.service.files().get_media(fileId=file_id).execute()
+        except errors.HttpError as error:
+            print('An error occurred: %s' % error)
+            return None
+
+    def BFS(self, queue):
+        if not queue:
+            return
+
+        folder = queue.popleft()
+        self.file_tree[folder[3]][folder[1]] = folder[0]
+
+        drive_folders, drive_files_dict = self._list_files_in_drive_folder(folder[0])
+
+        # if there is folder, insert folder to queue
+        if drive_folders:
+            for drive_folder in drive_folders:
+                temp = list(drive_folder)
+                temp.append(folder[2] + drive_folder[1] + '\\')
+                temp.append(folder[3] + 1)
+                queue.append(tuple(temp))
+
+        if drive_files_dict:
+            next_path = folder[2]
+
+            # check if the directory exist
+            if path.exists(next_path):
+                local_files = []
+                local_folders = []
+
+                # get all files and folders in current path
+                for f in listdir(next_path):
+                    if os.path.isfile(os.path.join(next_path, f)):
+                        local_files.append(f)
+                    else:
+                        local_folders.append(f)
+
+                if local_files:
+                    local_files_dict = {}
+
+                    # get last modified time of local files
+                    for local_file in local_files:
+                        datetime_object = datetime.fromtimestamp(os.path.getmtime(next_path + local_file))
+                        local_files_dict[local_file] = datetime_object
+
+                    local_files_set = set(local_files_dict.keys())
+                    drive_files_set = set(drive_files_dict.keys())
+
+                    for key, value in drive_files_dict.items():
+                        self.file_tree[folder[3] + 1][key] = value[1]
+                        if key in local_files_set:
+                            # if drive file's time is greater than local file's time, download file
+                            # else update file on drive
+                            if self._compare_times(value[0], local_files_dict[key]):
+                                if self._get_file_content(value[1]) != b'':
+                                    self._download_file(value[1], value[2], next_path)
+                            else:
+                                self._update_file(value[1], value[2], next_path)
+
+                    # upload all files that not exist on drive but exist on local
+                    for local_file in local_files_set.difference(drive_files_set):
+                        self.file_tree[folder[3] + 1][local_file] = self._upload_file(local_file, next_path, folder[0])
+                else:  # if file not exist in local, download all files on drive
+                    for drive_file in drive_files_dict.values():
+                        if self._get_file_content(drive_file[1]) != b'':
+                            self._download_file(drive_file[1], drive_file[2], next_path)
+            else:  # if directory doesn't exist, create the directory and download all files
+                try:
+                    os.mkdir(next_path)
+                    for drive_file in drive_files_dict.values():
+                        if self._get_file_content(drive_file[1]) != b'':
+                            self._download_file(drive_file[1], drive_file[2], next_path)
+                except OSError:
+                    print("Creation of the directory %s failed" % next_path)
+
+        self.BFS(queue)
+
     def sync(self):
         """
         Syncs drive folder and local folder
@@ -212,70 +293,11 @@ class GoogleDriveFolderSynchronizer:
             self.get_list_all_folders()
 
         # Use queue to travers all folders in file tree
-        queue = deque([(self.config['target_folder_id'], self.config['target_folder_name'])])
-        current_path = self.config['base_folder_dir']
+        queue = deque([(self.config['target_folder_id'], self.config['target_folder_name'], self.config['base_folder_dir'] + self.config['target_folder_name'] + '\\', 0)])
 
-        while queue:
-            folder = queue.popleft()
-
-            drive_folders, drive_files_dict = self._list_files_in_drive_folder(folder[0])
-
-            # if there is folder, insert folder to queue
-            if drive_folders:
-                for drive_folder in drive_folders:
-                    queue.append(drive_folder)
-
-            if drive_files_dict:
-                current_path += folder[1] + '\\'
-
-                # check if the directory exist
-                if path.exists(current_path):
-                    local_files = []
-                    local_folders = []
-
-                    # get all files and folders in current path
-                    for f in listdir(current_path):
-                        if os.path.isfile(os.path.join(current_path, f)):
-                            local_files.append(f)
-                        else:
-                            local_folders.append(f)
-
-                    if local_files:
-                        local_files_dict = {}
-
-                        # get last modified time of local files
-                        for local_file in local_files:
-                            datetime_object = datetime.fromtimestamp(os.path.getmtime(current_path + local_file))
-                            local_files_dict[local_file] = datetime_object
-
-                        local_files_set = set(local_files_dict.keys())
-                        drive_files_set = set(drive_files_dict.keys())
-
-                        for key, value in drive_files_dict.items():
-                            if key in local_files_set:
-                                # if drive file's time is greater than local file's time, download file
-                                # else update file on drive
-                                if self._compare_times(value[0], local_files_dict[key]):
-                                    self._download_file(value[1], value[2], current_path)
-                                else:
-                                    self._update_file(value[1], value[2], current_path)
-
-                        # upload all files that not exist on drive but exist on local
-                        for local_file in local_files_set.difference(drive_files_set):
-                            self._upload_file(local_file, current_path, folder[0])
-                    else:  # if file not exist in local, download all files on drive
-                        for drive_file in drive_files_dict.values():
-                            self._download_file(drive_file[1], drive_file[2], current_path)
-                else:  # if directory doesn't exist, create the directory and download all files
-                    try:
-                        os.mkdir(current_path)
-                        for drive_file in drive_files_dict.values():
-                            self._download_file(drive_file[1], drive_file[2], current_path)
-                    except OSError:
-                        print("Creation of the directory %s failed" % current_path)
+        self.BFS(queue)
 
 
 if __name__ == '__main__':
-    print(get_localzone())
     synchronizer = GoogleDriveFolderSynchronizer()
     synchronizer.sync()
