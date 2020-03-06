@@ -3,6 +3,7 @@ import io
 from os import listdir, path
 import os.path
 import pickle
+import time
 
 from apiclient import errors
 from google.auth.transport.requests import Request
@@ -10,10 +11,15 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 from dateutil import parser
 from collections import deque
 from datetime import datetime
 from tzlocal import get_localzone
+
+from Handler import Handler
 
 
 class GoogleDriveFolderSynchronizer:
@@ -164,12 +170,13 @@ class GoogleDriveFolderSynchronizer:
             status, done = downloader.next_chunk()
             print("Download %d%%." % int(status.progress() * 100))
 
-    def _upload_file(self, file_name, file_path, target_folder_id):
+    def upload_file(self, file_name, file_path, target_folder_id):
         """
         Upload file to drive
         :param file_name: the name of target file
         :param file_path: the local path of target file
         :param target_folder_id: the id of parent folder of target file
+        :return: created file's id
         """
         file_metadata = {
             'name': file_name,
@@ -212,6 +219,16 @@ class GoogleDriveFolderSynchronizer:
         except errors.HttpError as error:
             print('An error occurred: %s' % error)
             return None
+
+    def create_folder_in_drive(self, folder_name, parent_folder_id):
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_folder_id]
+        }
+        file = self.service.files().create(body=file_metadata,
+                                           fields='id').execute()
+        return file.get('id')
 
     def BFS(self, queue):
         if not queue:
@@ -269,7 +286,7 @@ class GoogleDriveFolderSynchronizer:
 
                     # upload all files that not exist on drive but exist on local
                     for local_file in local_files_set.difference(drive_files_set):
-                        self.file_tree[folder[3] + 1][local_file] = self._upload_file(local_file, next_path, folder[0])
+                        self.file_tree[folder[3] + 1][local_file] = self.upload_file(local_file, next_path, folder[0])
                 else:  # if file not exist in local, download all files on drive
                     for drive_file in drive_files_dict.values():
                         if self._get_file_content(drive_file[1]) != b'':
@@ -293,11 +310,34 @@ class GoogleDriveFolderSynchronizer:
             self.get_list_all_folders()
 
         # Use queue to travers all folders in file tree
-        queue = deque([(self.config['target_folder_id'], self.config['target_folder_name'], self.config['base_folder_dir'] + self.config['target_folder_name'] + '\\', 0)])
+        queue = deque([(self.config['target_folder_id'], self.config['target_folder_name'],
+                        self.config['base_folder_dir'] + self.config['target_folder_name'] + '\\', 0)])
 
         self.BFS(queue)
 
 
+class Watcher:
+    def __init__(self, syncer):
+        self.observer = Observer()
+        self.syncer = syncer
+
+    def run(self):
+        event_handler = Handler(self.syncer)
+        self.observer.schedule(event_handler,
+                               self.syncer.config['base_folder_dir'] + self.syncer.config['target_folder_name'],
+                               recursive=True)
+        self.observer.start()
+
+        try:
+            while True:
+                time.sleep(5)
+        except Exception as error:
+            self.observer.stop()
+            print(error)
+
+
 if __name__ == '__main__':
     synchronizer = GoogleDriveFolderSynchronizer()
-    synchronizer.sync()
+    #synchronizer.sync()
+    watcher = Watcher(synchronizer)
+    watcher.run()
